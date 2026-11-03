@@ -1,10 +1,12 @@
 package ru.company.metadatabackend.controller;
 
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.server.ResponseStatusException;
 import ru.company.metadatabackend.entity.FieldDef;
+import ru.company.metadatabackend.entity.FieldType;
 import ru.company.metadatabackend.entity.TableDef;
 import ru.company.metadatabackend.repository.FieldDefRepository;
 import ru.company.metadatabackend.repository.TableDefRepository;
@@ -12,10 +14,9 @@ import ru.company.metadatabackend.service.RuleRegistry;
 import ru.company.metadatabackend.service.rules.EntityRule;
 
 import java.math.BigDecimal;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
+@Slf4j
 @RestController
 @RequestMapping("/api/data")
 @CrossOrigin(origins = "http://localhost:3000")
@@ -33,11 +34,68 @@ public class DataController {
         this.ruleRegistry = ruleRegistry;
     }
 
-    @SuppressWarnings("SqlResolve") // <-- Добавьте эту строку
     @GetMapping("/{tableName}")
     public List<Map<String, Object>> getRecords(@PathVariable String tableName) {
         validateTable(tableName);
-        return jdbcTemplate.queryForList("SELECT * FROM v_" + tableName);
+        TableDef table = getTable(tableName);
+        List<FieldDef> fields = getFields(table);
+
+        StringBuilder select = new StringBuilder("SELECT t.* ");
+        StringBuilder joins = new StringBuilder();
+        Map<String, String> aliases = new HashMap<>();
+
+        for (FieldDef field : fields) {
+            if (field.getType() == FieldType.RELATION) {
+                String finalColumn = buildRelationJoin(field, "t", tableName, joins, aliases, 1);
+                if (finalColumn != null) {
+                    select.append(", ").append(finalColumn)
+                            .append(" AS ").append(field.getSystemName()).append("_display ");
+                }
+            }
+        }
+
+        String finalSql = select.toString() + " FROM v_" + tableName + " t " + joins.toString();
+        log.info("Выполняется SQL-запрос: {}", finalSql);
+
+        try {
+            return jdbcTemplate.queryForList(finalSql);
+        } catch (Exception e) {
+            log.error("Ошибка выполнения запроса: {}", finalSql, e);
+            throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Ошибка БД: " + e.getMessage());
+        }
+    }
+
+    private String buildRelationJoin(FieldDef field, String sourceAlias, String sourceTable,
+                                     StringBuilder joins, Map<String, String> aliases, int depth) {
+        if (depth > 5) return null; // Защита от бесконечной рекурсии
+
+        String targetTableName = field.getTargetTableName();
+        if (targetTableName == null) return null;
+
+        String alias = "rel_" + depth + "_" + field.getSystemName();
+
+        if (!aliases.containsKey(alias)) {
+            joins.append(" LEFT JOIN v_").append(targetTableName).append(" ").append(alias)
+                    .append(" ON ").append(sourceAlias).append(".").append(field.getSystemName())
+                    .append(" = ").append(alias).append(".id ");
+            aliases.put(alias, targetTableName);
+        }
+
+        // ИСПРАВЛЕНИЕ: используем final-переменную для лямбды
+        final String targetDisplayName = field.getTargetDisplayField() != null ? field.getTargetDisplayField() : "id";
+
+        TableDef targetTable = getTable(targetTableName);
+        List<FieldDef> targetFields = getFields(targetTable);
+
+        Optional<FieldDef> displayFieldDef = targetFields.stream()
+                .filter(f -> f.getSystemName().equalsIgnoreCase(targetDisplayName))
+                .findFirst();
+
+        if (displayFieldDef.isPresent() && displayFieldDef.get().getType() == FieldType.RELATION) {
+            return buildRelationJoin(displayFieldDef.get(), alias, targetTableName, joins, aliases, depth + 1);
+        } else {
+            return alias + "." + targetDisplayName;
+        }
     }
 
     @PostMapping("/{tableName}")
@@ -46,22 +104,36 @@ public class DataController {
         TableDef table = getTable(tableName);
         List<FieldDef> fields = getFields(table);
 
-        // 1. Выполняем Java-правило BEFORE_CREATE
         EntityRule rule = ruleRegistry.getRule(tableName);
         if (rule != null) {
             try { rule.beforeCreate(payload, null); }
             catch (Exception e) { throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Правило не пройдено: " + e.getMessage()); }
         }
 
-        // 2. Сборка SQL для INSERT
         StringBuilder columns = new StringBuilder();
         StringBuilder values = new StringBuilder();
         List<Object> params = new ArrayList<>();
-        payload.forEach((k, v) -> {
-            columns.append(k).append(",");
-            values.append("?,");
-            params.add(convertValue(v, fields, k));
-        });
+
+        for (FieldDef field : fields) {
+            // ИСПРАВЛЕНИЕ: убрали лямбду, используем обычный цикл
+            Object val = null;
+            boolean found = false;
+            for (Map.Entry<String, Object> entry : payload.entrySet()) {
+                if (entry.getKey().equalsIgnoreCase(field.getSystemName())) {
+                    val = entry.getValue();
+                    found = true;
+                    break;
+                }
+            }
+
+            if (found) {
+                columns.append(field.getSystemName()).append(",");
+                values.append("?,");
+                params.add(convertValue(val, field.getType()));
+            }
+        }
+
+        if (columns.length() == 0) throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Нет данных");
         columns.setLength(columns.length() - 1);
         values.setLength(values.length() - 1);
 
@@ -69,7 +141,7 @@ public class DataController {
         try {
             jdbcTemplate.update(sql, params.toArray());
         } catch (Exception e) {
-            e.printStackTrace();
+            log.error("Ошибка при вставке", e);
             throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Ошибка БД: " + e.getMessage());
         }
     }
@@ -80,38 +152,42 @@ public class DataController {
         TableDef table = getTable(tableName);
         List<FieldDef> fields = getFields(table);
 
-        // 1. Получаем текущую версию из БД
-        Long currentVersion = jdbcTemplate.queryForObject(
-                "SELECT version FROM " + tableName + " WHERE id = ?", Long.class, id);
-
+        Long currentVersion = jdbcTemplate.queryForObject("SELECT version FROM " + tableName + " WHERE id = ?", Long.class, id);
         Long clientVersion = Long.parseLong(payload.get("version").toString());
         if (currentVersion == null || !currentVersion.equals(clientVersion)) {
-            throw new ResponseStatusException(HttpStatus.CONFLICT, "Запись была изменена другим пользователем. Обновите страницу.");
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "Запись была изменена другим пользователем.");
         }
 
-        // 2. Выполняем Java-правило BEFORE_UPDATE
         EntityRule rule = ruleRegistry.getRule(tableName);
         if (rule != null) {
             try {
                 Map<String, Object> oldRecord = jdbcTemplate.queryForMap("SELECT * FROM " + tableName + " WHERE id = ?", id);
                 rule.beforeUpdate(payload, oldRecord);
-            } catch (Exception e) {
-                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Правило не пройдено: " + e.getMessage());
-            }
+            } catch (Exception e) { throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Правило не пройдено: " + e.getMessage()); }
         }
 
-        // 3. Сборка SQL для UPDATE
         StringBuilder setClause = new StringBuilder();
         List<Object> params = new ArrayList<>();
 
-        payload.forEach((k, v) -> {
-            if (!k.equals("id") && !k.equals("version") && !k.equals("created_at") && !k.equals("updated_at")) {
-                setClause.append(k).append(" = ?, ");
-                params.add(convertValue(v, fields, k));
+        for (FieldDef field : fields) {
+            // ИСПРАВЛЕНИЕ: убрали лямбду, используем обычный цикл
+            Object val = null;
+            boolean found = false;
+            for (Map.Entry<String, Object> entry : payload.entrySet()) {
+                if (entry.getKey().equalsIgnoreCase(field.getSystemName())) {
+                    val = entry.getValue();
+                    found = true;
+                    break;
+                }
             }
-        });
 
-        // Добавляем системные поля
+            if (found) {
+                setClause.append(field.getSystemName()).append(" = ?, ");
+                params.add(convertValue(val, field.getType()));
+            }
+        }
+
+        if (setClause.length() == 0) return;
         setClause.append("version = version + 1, updated_at = CURRENT_TIMESTAMP");
 
         String sql = "UPDATE " + tableName + " SET " + setClause + " WHERE id = ? AND version = ?";
@@ -120,9 +196,7 @@ public class DataController {
 
         try {
             int rows = jdbcTemplate.update(sql, params.toArray());
-            if (rows == 0) {
-                throw new ResponseStatusException(HttpStatus.CONFLICT, "Конфликт версий при обновлении.");
-            }
+            if (rows == 0) throw new ResponseStatusException(HttpStatus.CONFLICT, "Конфликт версий.");
         } catch (Exception e) {
             if (e instanceof ResponseStatusException) throw (ResponseStatusException) e;
             throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Ошибка БД: " + e.getMessage());
@@ -135,7 +209,6 @@ public class DataController {
         jdbcTemplate.update("DELETE FROM " + tableName + " WHERE id = ?", id);
     }
 
-    // Вспомогательные методы
     private void validateTable(String tableName) {
         if (tableRepo.findAll().stream().noneMatch(t -> t.getSystemName().equals(tableName))) {
             throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Таблица не найдена");
@@ -150,16 +223,12 @@ public class DataController {
         return fieldRepo.findAll().stream().filter(f -> f.getTable().getId().equals(table.getId())).toList();
     }
 
-    private Object convertValue(Object raw, List<FieldDef> fields, String fieldName) {
+    private Object convertValue(Object raw, FieldType type) {
         if (raw == null) return null;
         String str = raw.toString().trim();
         if (str.isEmpty()) return null;
-
-        FieldDef field = fields.stream().filter(f -> f.getSystemName().equals(fieldName)).findFirst().orElse(null);
-        if (field == null) return str; // Системное поле (version, id и т.д.)
-
         try {
-            return switch (field.getType()) {
+            return switch (type) {
                 case INTEGER -> Integer.parseInt(str);
                 case LONG, RELATION -> Long.parseLong(str);
                 case DECIMAL -> new BigDecimal(str);
@@ -169,7 +238,7 @@ public class DataController {
                 case STRING, TEXT -> str;
             };
         } catch (Exception e) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Неверный формат данных для поля " + fieldName);
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Неверный формат данных: " + str);
         }
     }
 }

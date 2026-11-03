@@ -33,7 +33,9 @@ public class TableController {
 
     @PostMapping
     public TableDef createTable(@RequestBody TableDef table) {
+        table.setSystemName(table.getSystemName().toLowerCase());
         TableDef savedTable = tableRepo.save(table);
+
 
         // ДОБАВЛЯЕМ СИСТЕМНЫЕ ПОЛЯ:
         // version - для оптимистичной блокировки
@@ -73,6 +75,7 @@ public class TableController {
     public FieldDef createField(@PathVariable Long id, @RequestBody FieldDef field) {
         TableDef table = tableRepo.findById(id)
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Table not found"));
+        field.setSystemName(field.getSystemName().toLowerCase()); // <-- ДОБАВИТЬ
         field.setTable(table);
 
         // 1. Сохраняем метаданные поля
@@ -137,13 +140,14 @@ public class TableController {
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Поле не найдено"));
 
         TableDef table = field.getTable();
-        String columnName = field.getSystemName();
+        // Приводим имя колонки к нижнему регистру, чтобы соответствовать PostgreSQL
+        String columnName = field.getSystemName().toLowerCase();
 
         try {
-            // Удаляем физическую колонку
-            jdbcTemplate.execute("ALTER TABLE " + table.getSystemName() + " DROP COLUMN " + columnName);
+            // Используем DROP COLUMN IF EXISTS, чтобы избежать ошибки, если колонки уже нет
+            jdbcTemplate.execute("ALTER TABLE " + table.getSystemName() + " DROP COLUMN IF EXISTS " + columnName);
 
-            // Пересоздаем вьюху, чтобы она обновилась без этой колонки
+            // Пересоздаем вьюху
             String viewSql = "CREATE OR REPLACE VIEW v_" + table.getSystemName() + " AS SELECT * FROM " + table.getSystemName();
             jdbcTemplate.execute(viewSql);
 
