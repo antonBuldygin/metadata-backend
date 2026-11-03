@@ -223,7 +223,7 @@ public class DataController {
         return fieldRepo.findAll().stream().filter(f -> f.getTable().getId().equals(table.getId())).toList();
     }
 
-    private Object convertValue(Object raw, FieldType type) {
+    public Object convertValue(Object raw, FieldType type) {
         if (raw == null) return null;
         String str = raw.toString().trim();
         if (str.isEmpty()) return null;
